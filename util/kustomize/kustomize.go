@@ -28,15 +28,21 @@ import (
 // represents a Docker image in the format NAME[:TAG].
 type Image = string
 
+type BuildOpts struct {
+	KubeVersion string
+	APIVersions []string
+}
+
 // Kustomize provides wrapper functionality around the `kustomize` command.
 type Kustomize interface {
 	// Build returns a list of unstructured objects from a `kustomize build` command and extract supported parameters
-	Build(opts *v1alpha1.ApplicationSourceKustomize, kustomizeOptions *v1alpha1.KustomizeOptions, envVars *v1alpha1.Env) ([]*unstructured.Unstructured, []Image, error)
+	Build(opts *v1alpha1.ApplicationSourceKustomize, kustomizeOptions *v1alpha1.KustomizeOptions, envVars *v1alpha1.Env, buildOpts *BuildOpts) ([]*unstructured.Unstructured, []Image, error)
 }
 
 // NewKustomizeApp create a new wrapper to run commands on the `kustomize` command-line tool.
-func NewKustomizeApp(path string, creds git.Creds, fromRepo string, binaryPath string) Kustomize {
+func NewKustomizeApp(repoRoot string, path string, creds git.Creds, fromRepo string, binaryPath string) Kustomize {
 	return &kustomize{
+		repoRoot:   repoRoot,
 		path:       path,
 		creds:      creds,
 		repo:       fromRepo,
@@ -45,6 +51,8 @@ func NewKustomizeApp(path string, creds git.Creds, fromRepo string, binaryPath s
 }
 
 type kustomize struct {
+	// path to the Git repository root
+	repoRoot string
 	// path inside the checked out tree
 	path string
 	// creds structure
@@ -85,8 +93,7 @@ func mapToEditAddArgs(val map[string]string) []string {
 	return args
 }
 
-func (k *kustomize) Build(opts *v1alpha1.ApplicationSourceKustomize, kustomizeOptions *v1alpha1.KustomizeOptions, envVars *v1alpha1.Env) ([]*unstructured.Unstructured, []Image, error) {
-
+func (k *kustomize) Build(opts *v1alpha1.ApplicationSourceKustomize, kustomizeOptions *v1alpha1.KustomizeOptions, envVars *v1alpha1.Env, buildOpts *BuildOpts) ([]*unstructured.Unstructured, []Image, error) {
 	env := os.Environ()
 	if envVars != nil {
 		env = append(env, envVars.Environ()...)
@@ -180,6 +187,9 @@ func (k *kustomize) Build(opts *v1alpha1.ApplicationSourceKustomize, kustomizeOp
 			args := []string{"edit", "add", "label"}
 			if opts.ForceCommonLabels {
 				args = append(args, "--force")
+			}
+			if opts.LabelWithoutSelector {
+				args = append(args, "--without-selector")
 			}
 			commonLabels := map[string]string{}
 			for name, value := range opts.CommonLabels {
@@ -295,12 +305,13 @@ func (k *kustomize) Build(opts *v1alpha1.ApplicationSourceKustomize, kustomizeOp
 
 	var cmd *exec.Cmd
 	if kustomizeOptions != nil && kustomizeOptions.BuildOptions != "" {
-		params := parseKustomizeBuildOptions(k.path, kustomizeOptions.BuildOptions)
+		params := parseKustomizeBuildOptions(k.path, kustomizeOptions.BuildOptions, buildOpts)
 		cmd = exec.Command(k.getBinaryPath(), params...)
 	} else {
 		cmd = exec.Command(k.getBinaryPath(), "build", k.path)
 	}
 	cmd.Env = env
+	cmd.Dir = k.repoRoot
 	out, err := executil.Run(cmd)
 	if err != nil {
 		return nil, nil, err
@@ -314,8 +325,23 @@ func (k *kustomize) Build(opts *v1alpha1.ApplicationSourceKustomize, kustomizeOp
 	return objs, getImageParameters(objs), nil
 }
 
-func parseKustomizeBuildOptions(path, buildOptions string) []string {
-	return append([]string{"build", path}, strings.Fields(buildOptions)...)
+func parseKustomizeBuildOptions(path string, buildOptions string, buildOpts *BuildOpts) []string {
+	buildOptsParams := append([]string{"build", path}, strings.Fields(buildOptions)...)
+
+	if buildOpts != nil && !getSemverSafe().LessThan(semver.MustParse("v5.3.0")) && isHelmEnabled(buildOptions) {
+		if buildOpts.KubeVersion != "" {
+			buildOptsParams = append(buildOptsParams, "--helm-kube-version", buildOpts.KubeVersion)
+		}
+		for _, v := range buildOpts.APIVersions {
+			buildOptsParams = append(buildOptsParams, "--helm-api-versions", v)
+		}
+	}
+
+	return buildOptsParams
+}
+
+func isHelmEnabled(buildOptions string) bool {
+	return strings.Contains(buildOptions, "--enable-helm")
 }
 
 var KustomizationNames = []string{"kustomization.yaml", "kustomization.yml", "Kustomization"}
@@ -399,7 +425,7 @@ func Version(shortForm bool) (string, error) {
 	// short: "{kustomize/v3.8.1  2020-07-16T00:58:46Z  }"
 	version, err := executil.Run(cmd)
 	if err != nil {
-		return "", fmt.Errorf("could not get kustomize version: %s", err)
+		return "", fmt.Errorf("could not get kustomize version: %w", err)
 	}
 	version = strings.TrimSpace(version)
 	if shortForm {
@@ -413,7 +439,6 @@ func Version(shortForm bool) (string, error) {
 
 		// remove extra 'kustomize/' before version
 		version = strings.TrimPrefix(version, "kustomize/")
-
 	}
 	return version, nil
 }
